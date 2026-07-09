@@ -407,6 +407,11 @@
       'BlockTime',
       'Block_Time',
       'Block Time',
+      'blockHours',
+      'block_hours',
+      'BlockHours',
+      'Block_Hours',
+      'Block Hours',
       'setupTime',
       'setup_time',
       'setUpTime',
@@ -428,12 +433,127 @@
       'setup',
       'Setup',
       'setUp',
-      'Set Up'
+      'Set Up',
+      'block',
+      'Block'
     ]);
   }
 
   function formatTimeMetric(value) {
     return Number.isFinite(value) ? value.toFixed(2) : '--';
+  }
+
+  function rgbFromCss(value) {
+    const match = String(value || '').match(/rgba?\(([^)]+)\)/i);
+    if (!match) return null;
+    const parts = match[1].split(',').map(part => Number.parseFloat(part.trim()));
+    if (parts.length < 3 || parts.some((part, index) => index < 3 && !Number.isFinite(part))) return null;
+    if (parts.length > 3 && parts[3] <= 0.05) return null;
+    return { r: parts[0], g: parts[1], b: parts[2] };
+  }
+
+  function rgbToHsl({ r, g, b }) {
+    r /= 255;
+    g /= 255;
+    b /= 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const lightness = (max + min) / 2;
+    if (max === min) return { hue: 0, saturation: 0, lightness };
+    const delta = max - min;
+    const saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+    const hue = max === r
+      ? ((g - b) / delta + (g < b ? 6 : 0)) * 60
+      : max === g
+        ? ((b - r) / delta + 2) * 60
+        : ((r - g) / delta + 4) * 60;
+    return { hue, saturation, lightness };
+  }
+
+  function periodRoleFromColor(color) {
+    const rgb = rgbFromCss(color);
+    if (!rgb) return null;
+    const { hue, saturation, lightness } = rgbToHsl(rgb);
+    if (saturation < 0.28 || hue < 140 || hue > 190) return null;
+    return lightness >= 0.58 ? 'away' : 'setup';
+  }
+
+  function rowOperatorName(row) {
+    const firstCell = row.querySelector('td,[role="cell"]');
+    const text = (firstCell?.innerText || firstCell?.textContent || '').trim();
+    const lines = text.split(/\n+/).map(line => line.trim()).filter(Boolean);
+    const name = lines.find(line => !/^id\b/i.test(line) && !/^operator$/i.test(line));
+    return name || '';
+  }
+
+  function latestHoursFromRow(row) {
+    const text = row.innerText || row.textContent || '';
+    const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*h\b/gi)].map(match => Number.parseFloat(match[1]));
+    if (matches.length >= 2) return matches[1];
+    return matches[0] || 0;
+  }
+
+  function periodMixRatiosFromRow(row) {
+    const candidates = [...row.querySelectorAll('*')].map(element => {
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 120 || rect.height < 4 || rect.height > 36) return null;
+      const segments = [...element.children].map(child => {
+        const childRect = child.getBoundingClientRect();
+        if (childRect.width < 1 || childRect.height < 3 || childRect.height > 36) return null;
+        const role = periodRoleFromColor(getComputedStyle(child).backgroundColor);
+        const color = rgbFromCss(getComputedStyle(child).backgroundColor);
+        if (!color) return null;
+        return { role, width: childRect.width };
+      }).filter(Boolean);
+      const coloredWidth = segments.reduce((sum, segment) => sum + segment.width, 0);
+      if (segments.length < 2 || coloredWidth < 80 || !segments.some(segment => segment.role)) return null;
+      return { element, rect, segments, coloredWidth };
+    }).filter(Boolean);
+    const candidate = candidates.sort((a, b) => b.coloredWidth - a.coloredWidth)[0];
+    if (!candidate) return null;
+    const awayWidth = candidate.segments
+      .filter(segment => segment.role === 'away')
+      .reduce((sum, segment) => sum + segment.width, 0);
+    const setupWidth = candidate.segments
+      .filter(segment => segment.role === 'setup')
+      .reduce((sum, segment) => sum + segment.width, 0);
+    return {
+      awayRatio: awayWidth / candidate.coloredWidth,
+      setupRatio: setupWidth / candidate.coloredWidth,
+      latestHours: latestHoursFromRow(row)
+    };
+  }
+
+  function pagePeriodMixByName() {
+    const rows = [...document.querySelectorAll('tr,[role="row"]')]
+      .filter(row => !row.closest?.(`#${C.overlayId}`));
+    const results = {};
+    rows.forEach(row => {
+      const name = rowOperatorName(row);
+      if (!name) return;
+      const ratios = periodMixRatiosFromRow(row);
+      if (!ratios) return;
+      const key = normalizeNameKey(name);
+      if (!key) return;
+      if (!results[key]) results[key] = [];
+      results[key].push(ratios);
+    });
+    return results;
+  }
+
+  function pagePeriodMixForOperator(name, pageMix, seenCounts, totalHours) {
+    const key = normalizeNameKey(name);
+    const list = pageMix[key];
+    if (!list?.length) return null;
+    const index = seenCounts[key] || 0;
+    seenCounts[key] = index + 1;
+    const mix = list[Math.min(index, list.length - 1)];
+    const baseHours = Number.isFinite(totalHours) && totalHours > 0 ? totalHours : mix.latestHours;
+    if (!Number.isFinite(baseHours) || baseHours <= 0) return null;
+    return {
+      away: mix.awayRatio > 0 ? baseHours * mix.awayRatio : null,
+      setup: mix.setupRatio > 0 ? baseHours * mix.setupRatio : null
+    };
   }
 
   function operatorHours(operator) {
@@ -490,17 +610,20 @@
   function normalize(raw) {
     const timestamp = raw?.collectionOps?.timestamp ? new Date(raw.collectionOps.timestamp) : new Date();
     const labelCounts = {};
+    const pageMix = pagePeriodMixByName();
+    const pageMixCounts = {};
     const operators = (raw?.collectionOps?.operators || [])
       .map(operator => {
         const total = operatorHours(operator);
+        const pagePeriodMix = pagePeriodMixForOperator(operator.operator, pageMix, pageMixCounts, total);
         return {
           name: operator.operator,
           locker: labelFor(operator.operator, labelCounts),
           total,
           projected: projected(total, timestamp),
           sessions: sessions(operator),
-          away: awayTime(operator),
-          setup: setupTime(operator)
+          away: pagePeriodMix?.away ?? awayTime(operator),
+          setup: pagePeriodMix?.setup ?? setupTime(operator)
         };
       })
       .filter(operator => operator.locker !== '--')
