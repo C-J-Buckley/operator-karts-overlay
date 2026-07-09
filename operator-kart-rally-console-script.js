@@ -440,11 +440,27 @@
   }
 
   function formatTimeMetric(value) {
-    return Number.isFinite(value) ? value.toFixed(2) : '--';
+    if (!Number.isFinite(value)) return '--';
+    const minutes = Math.max(0, Math.round(value * 60));
+    return `${minutes}m`;
   }
 
   function rgbFromCss(value) {
-    const match = String(value || '').match(/rgba?\(([^)]+)\)/i);
+    const text = String(value || '').trim();
+    if (!text || text === 'none' || text === 'transparent') return null;
+    const hex = text.match(/^#([0-9a-f]{3,8})$/i);
+    if (hex) {
+      let raw = hex[1];
+      if (raw.length === 3 || raw.length === 4) raw = raw.split('').map(char => char + char).join('');
+      const alpha = raw.length === 8 ? Number.parseInt(raw.slice(6, 8), 16) / 255 : 1;
+      if (alpha <= 0.05) return null;
+      return {
+        r: Number.parseInt(raw.slice(0, 2), 16),
+        g: Number.parseInt(raw.slice(2, 4), 16),
+        b: Number.parseInt(raw.slice(4, 6), 16)
+      };
+    }
+    const match = text.match(/rgba?\(([^)]+)\)/i);
     if (!match) return null;
     const parts = match[1].split(',').map(part => Number.parseFloat(part.trim()));
     if (parts.length < 3 || parts.some((part, index) => index < 3 && !Number.isFinite(part))) return null;
@@ -474,8 +490,48 @@
     const rgb = rgbFromCss(color);
     if (!rgb) return null;
     const { hue, saturation, lightness } = rgbToHsl(rgb);
-    if (saturation < 0.28 || hue < 140 || hue > 190) return null;
-    return lightness >= 0.58 ? 'away' : 'setup';
+    if (saturation < 0.24 || hue < 130 || hue > 215) return null;
+    return hue >= 180 || lightness >= 0.55 ? 'away' : 'setup';
+  }
+
+  function elementColor(element) {
+    const style = getComputedStyle(element);
+    return [
+      style.backgroundColor,
+      style.fill,
+      style.stroke,
+      element.getAttribute?.('fill'),
+      element.getAttribute?.('stroke')
+    ].find(value => rgbFromCss(value));
+  }
+
+  function colorStopsFromGradient(backgroundImage) {
+    const text = String(backgroundImage || '');
+    if (!text.includes('gradient')) return [];
+    const colorRegex = /(rgba?\([^)]+\)|#[0-9a-f]{3,8}|[a-z]+)\s+([\d.]+)%/ig;
+    const stops = [];
+    let match;
+    while ((match = colorRegex.exec(text))) {
+      const role = periodRoleFromColor(match[1]);
+      const position = Number.parseFloat(match[2]);
+      if (Number.isFinite(position)) stops.push({ role, position });
+    }
+    return stops.sort((a, b) => a.position - b.position);
+  }
+
+  function ratiosFromGradient(backgroundImage) {
+    const stops = colorStopsFromGradient(backgroundImage);
+    if (stops.length < 2) return null;
+    const widths = { away: 0, setup: 0, total: 0 };
+    for (let index = 0; index < stops.length - 1; index += 1) {
+      const current = stops[index];
+      const next = stops[index + 1];
+      const width = Math.max(0, next.position - current.position);
+      widths.total += width;
+      if (current.role) widths[current.role] += width;
+    }
+    if (widths.total <= 0 || (!widths.away && !widths.setup)) return null;
+    return { awayRatio: widths.away / widths.total, setupRatio: widths.setup / widths.total };
   }
 
   function rowOperatorName(row) {
@@ -494,23 +550,61 @@
   }
 
   function periodMixRatiosFromRow(row) {
+    const applyPeriodSegmentFallback = segments => {
+      if (segments.some(segment => segment.role) || segments.length < 3) return segments;
+      return segments.map((segment, index) => ({
+        ...segment,
+        role: index === segments.length - 1 ? 'away' : index === segments.length - 2 ? 'setup' : null
+      }));
+    };
     const candidates = [...row.querySelectorAll('*')].map(element => {
       const rect = element.getBoundingClientRect();
       if (rect.width < 120 || rect.height < 4 || rect.height > 36) return null;
+      const gradientRatios = ratiosFromGradient(getComputedStyle(element).backgroundImage);
+      if (gradientRatios) {
+        return {
+          element,
+          rect,
+          segments: [],
+          coloredWidth: rect.width,
+          ...gradientRatios
+        };
+      }
       const segments = [...element.children].map(child => {
         const childRect = child.getBoundingClientRect();
         if (childRect.width < 1 || childRect.height < 3 || childRect.height > 36) return null;
-        const role = periodRoleFromColor(getComputedStyle(child).backgroundColor);
-        const color = rgbFromCss(getComputedStyle(child).backgroundColor);
-        if (!color) return null;
-        return { role, width: childRect.width };
+        const colorValue = elementColor(child);
+        const role = periodRoleFromColor(colorValue);
+        const color = rgbFromCss(colorValue);
+        if (!color && childRect.width < 3) return null;
+        return { role, width: childRect.width, left: childRect.left };
       }).filter(Boolean);
-      const coloredWidth = segments.reduce((sum, segment) => sum + segment.width, 0);
-      if (segments.length < 2 || coloredWidth < 80 || !segments.some(segment => segment.role)) return null;
-      return { element, rect, segments, coloredWidth };
+      const descendantSegments = segments.length ? [] : [...element.querySelectorAll('*')].map(child => {
+        const childRect = child.getBoundingClientRect();
+        if (childRect.width < 1 || childRect.height < 3 || childRect.height > 36) return null;
+        if (childRect.left < rect.left - 1 || childRect.right > rect.right + 1) return null;
+        const colorValue = elementColor(child);
+        const role = periodRoleFromColor(colorValue);
+        const color = rgbFromCss(colorValue);
+        const tag = String(child.tagName || '').toLowerCase();
+        const likelySegment = ['rect', 'path', 'div', 'span'].includes(tag) && childRect.width >= 3;
+        if (!color && !likelySegment) return null;
+        return { role, width: childRect.width, left: childRect.left };
+      }).filter(Boolean);
+      const allSegments = applyPeriodSegmentFallback((segments.length ? segments : descendantSegments).sort((a, b) => a.left - b.left));
+      const coloredWidth = allSegments.reduce((sum, segment) => sum + segment.width, 0);
+      if (allSegments.length < 1 || coloredWidth < 8 || !allSegments.some(segment => segment.role)) return null;
+      return { element, rect, segments: allSegments, coloredWidth: Math.max(rect.width, coloredWidth) };
     }).filter(Boolean);
     const candidate = candidates.sort((a, b) => b.coloredWidth - a.coloredWidth)[0];
     if (!candidate) return null;
+    if (Number.isFinite(candidate.awayRatio) || Number.isFinite(candidate.setupRatio)) {
+      return {
+        awayRatio: candidate.awayRatio || 0,
+        setupRatio: candidate.setupRatio || 0,
+        latestHours: latestHoursFromRow(row)
+      };
+    }
     const awayWidth = candidate.segments
       .filter(segment => segment.role === 'away')
       .reduce((sum, segment) => sum + segment.width, 0);
